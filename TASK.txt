@@ -1,0 +1,80 @@
+Act immediately: do NOT spend time analyzing. You already know everything you need. Write the code now.
+
+You are building a standalone, GitHub-compatible git forge in TypeScript for a competition. It must run as ONE Node 22 process, bind an ephemeral port, and serve four surfaces from its own in-memory store: git smart HTTP, the REST v3 API, GraphQL v4, and MCP. No UI, no outside service, no git binary, no database. Node standard library + source you vendor only. Everything serves from memory (a Map/object store is fine).
+
+THE LIFECYCLE (exact contract — main.ts already implements most of this, keep it):
+- The program imports createApp from './app.ts', binds listen(0), POSTs {port:N} to $MAKEFUN_ENV_URL/register, then long-polls GET $MAKEFUN_ENV_URL/done until {done:true}, then exits 0. main.ts is done — grow app.ts.
+- The store's bearer token is in process.env.MAKEFUN_SHOP_TOKEN. Requests present Authorization: Bearer <token>. Without it → 401. A repo belongs to the login the token names (so /api/v3/user/repos and repos are under that single owner).
+- Every REST reply is application/json (never HTML) with a non-empty X-GitHub-Request-Id header.
+- Unknown route → 404 {"message":"Not Found"}. Malformed JSON body → 400.
+
+THE WIRE CONTRACT (implement every line):
+
+REST v3 under /api/v3 (all JSON, must send X-GitHub-Request-Id):
+- GET /api/v3/ → 200 JSON, header X-OAuth-Scopes: 'repo, read:org'
+- GET /api/v3/meta → 200 {"installed_version":"..."} (non-empty)
+- GET /api/v3/user/repos → 200 array of repo objects
+- POST /api/v3/user/repos → 201, the repository object {name, full_name, owner:{login}, ...}
+- GET /api/v3/repos/{owner}/{repo} → 200 repo; 404 JSON if missing (a repo under a different owner is 404, never 403)
+- PATCH /api/v3/repos/{owner}/{repo} → 200, description updated
+- DELETE /api/v3/repos/{owner}/{repo} → 204; later GET → 404
+- PUT /api/v3/repos/{owner}/{repo}/contents/{path} → 201 on create, 200 on update, 409 on stale sha
+- DELETE /api/v3/repos/{owner}/{repo}/contents/{path} → 200 {commit:{sha}}; later GET → 404
+- POST /api/v3/repos/{owner}/{repo}/labels → 201 {name}; a label must exist before an issue may carry it
+- POST /api/v3/repos/{owner}/{repo}/issues → 201, open issue; 422 if it names a nonexistent label
+- POST /api/v3/repos/{owner}/{repo}/pulls → 201, state open, with head and base fields
+- GET /api/v3/repos/{owner}/{repo}/pulls/{number} → 200; 404 if unknown
+- PUT /api/v3/repos/{owner}/{repo}/pulls/{number}/merge → 200 {sha, merged:true, message}; 404 unknown pull, 405 conflicted
+
+Git smart HTTP at /{owner}/{repo}.git:
+- Repos are created via REST POST /api/v3/user/repos. A push cannot invent one.
+- The suite speaks smart HTTP in-process (no git binary). It expects:
+  - GET /{owner}/{repo}.git/info/refs?service=git-upload-pack → protocol v2 advertisement opening with "version 2" (the suite sends Git-Protocol: version=2). Must support v2 capability advertisement and ls-refs. If you can only do v0, it loses 3 checks but works otherwise.
+  - POST /{owner}/{repo}.git/git-upload-pack → the v2 ls-refs / fetch response (packfile or negotiation).
+  - GET /{owner}/{repo}.git/info/refs?service=git-receive-pack → v0 advertisement opening with "# service=git-receive-pack", advertising report-status, side-band-64k, delete-refs.
+  - POST /{owner}/{repo}.git/git-receive-pack → apply the push. Must support report-status, side-band-64k. Every update must fast-forward: non-fast-forward → "ng <ref> non-fast-forward" per ref, and the ref does not move.
+  - Missing repo → 404 on both services' /info/refs.
+- This is the single hardest part. You MUST implement a working smart-HTTP pack protocol: parse the pkt-line framing (4 hex length prefix), the ref advertisement, ls-refs, and receive-pack's commands. For push you need to at least store the new ref deltas (you can be lenient on actual packfile objects — the suite checks refs move and fast-forward rules, and that clone gets refs/objects back). If implementing full packfile delta decoding is too much, the minimal viable path: maintain refs + a lightweight object store keyed by sha, serve ls-refs and refs, and on receive-pack update refs per the command list (fast-forward checking by comparing parent shas you track).
+
+GraphQL v4 at POST /api/graphql:
+- Body {"query":..., "variables":{}} with bearer token; unauthenticated → exactly 401.
+- Must handle the documents gh and github-mcp-server send, and introspection:
+  - __type(name:"Issue") lists id, number, title, state, body
+  - __type(name:"PullRequest") lists id, number, headRefName, baseRefName, mergeable, state, merged, files
+  - __type(name:"Repository") lists id, databaseId, name, nameWithOwner, owner, defaultBranchRef, viewerPermission, hasIssuesEnabled, issue, issues, pullRequests, pullRequest
+  - SearchType enumValues include ISSUE
+  - repository.issues with orderBy:{field:CREATED_AT,direction:DESC} returns numbers descending, ties by number DESC; states:[OPEN] omits closed
+  - createPullRequest takes repository id + head branch (pushed over git), opens a PR REST reads back with same head/base
+  - Two operation documents in one body → two results in order
+  - Query naming unknown field → HTTP 200 with errors array naming it
+  - Unknown repository → data.repository = null with no errors
+- Implementation: implement a minimal GraphQL query executor over your store. Introspection is essential (__type, fields, enums). A simple resolver that walks the query AST against your in-memory model and answers the known shapes is enough — you don't need a full GraphQL library, but you can't depend on one (no install). Write a small executor.
+
+MCP at POST /mcp:
+- JSON-RPC 2.0 over Streamable HTTP, answering application/json or text/event-stream. Each request answers inside 3 seconds.
+- Revision 2026-07-28: every request declares it, server/discover answers a result whose supportedVersions is a non-empty list of YYYY-MM-DD revisions. Also support handshake 2025-11-25 via initialize + notifications/initialized with optional Mcp-Session-Id.
+- tools/list offers at least 6 tools: create_repo, get_repo, create_issue, list_issues, create_pull_request, merge_pull_request (a server prefix allowed, matched case-insensitively as suffix). Every tool needs a non-empty description and inputSchema {type:"object"}. Two tools/list calls answer byte-identical lists.
+- tools/call with the args github-mcp-server documents: create_repo {name}, get_repo {owner,repo}, create_issue {owner,repo,title,body?}, list_issues {owner,repo,state?}, create_pull_request {owner,repo,title,head,base}, merge_pull_request {owner,repo,pull_number}. Map each arg onto your schema's nearest property. Fill a full_name property with owner/repo.
+- Two in-flight requests keep their own JSON-RPC ids and answer for their own args.
+- Unknown tool → -32602 or -32601, never HTTP 500. Missing required arg → isError:true or -32602. Non-JSON body → HTTP 400 with -32700. No Authorization header → 401.
+- MCP tools act on the SAME store as REST: a repo/issue created over MCP reads back over REST as the same object.
+
+PERFORMANCE (200 points, 50/workload — beat the reference forge's T_ref):
+- push: 200 sequential 1 KiB pushes to one repo. Make pushes fast: don't re-parse/gc the whole store each time.
+- clone: 50 concurrent shallow clones (depth 1) of a 200-commit repo. Serve ls-refs + pack quickly; budget for concurrency.
+- read: 2,000 GET /repos/{owner}/{repo}/issues/{number} on one keep-alive connection. Make REST reads synchronous & fast (Map lookups).
+- write: 200 issue creations. Fast object creation.
+- Keep response handling event-loop-friendly (no blocking sync disk I/O; you're all in-memory).
+
+DETERMINISM: two runs on the same instance must leave byte-identical state export. Keep all time out of any state you'd ever expose. Do not use Date.now() in responses or store.
+
+WHAT TO DO:
+1. Read the starter main.ts + app.ts in /tmp/dsh/gh-clone/ to learn the lifecycle. Keep main.ts as-is.
+2. Build the full forge in app.ts (and any helper .ts files you add, all in the repo root or src/). Node 22 runs it as node main.ts. Use only node: builtins (http, crypto, zlib). No npm installs.
+3. Self-test: the kit has a local conformance runner. Run:
+   node --experimental-strip-types /tmp/dsh/gh-clone-kit/sdk/run.ts --url http://127.0.0.1:PORT --token "$TOKEN" --perf --json
+   against your server. That runs the exact sealed checks + benchmark. Iterate until you pass as many as possible. Aim for all 120 checks then push perf. (Run your server in background on a fixed port, e.g. 8180, and point the runner at it.)
+4. Write to /tmp/dsh/gh-clone/ (app.ts + helpers). Commit with git regularly.
+5. Report: score from the runner (feature/agent/perf), which checks pass, and the perf p50s for the four workloads.
+
+Keep ALL code written by you. You may read the starter and the sdk/conformance sources as reference, but write every line yourself. The starter is seed material, not your deliverable. Do not paste the reference forge's code.
